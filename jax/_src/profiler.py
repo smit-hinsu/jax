@@ -50,7 +50,9 @@ class ProfileOptions(_profiler.ProfileOptions):
   """Profiler Options to configure the collectors for the profiler."""
 
 
-def start_server(port: int) -> _profiler.ProfilerServer:
+def start_server(
+    port: int, requires_backend: bool = True
+) -> _profiler.ProfilerServer:
   """Starts the profiler server on port `port`.
 
   Using the "TensorFlow profiler" feature in `TensorBoard
@@ -68,7 +70,8 @@ def start_server(port: int) -> _profiler.ProfilerServer:
   # fail and no TPU operations will be included in the profile.
   # NOTE(skyewm): I'm not sure this is necessary for start_server (is definitely
   # is for start_trace), but I'm putting it here to be safe.
-  xla_bridge.get_backend()
+  if requires_backend:
+    xla_bridge.get_backend()
 
   _profiler_server = _profiler.start_server(port)
   return _profiler_server
@@ -80,6 +83,34 @@ def stop_server():
   if _profiler_server is None:
     raise ValueError("No active profiler server.")
   _profiler_server = None # Should destroy the profiler server
+
+
+def register_subprocess(pid: int, port: int) -> _profiler.UnregisterFn:
+  """Registers a subprocess's profiler server to be profiled alongside the current process.
+
+  When the current process collects a profile (either programmatically or via
+  its profiler server), it will propagate the request to all registered
+  subprocesses' profiler servers and subsequently, aggregate all their responses
+  into the main response returned by this process's profiler server.
+
+  This is helpful when running workers in separate processes that may affect the
+  performance of the main process (e.g. PyGrain).
+
+  NOTE: Currently, only CPU profiling of subprocesses is supported.
+
+  Args:
+    pid: The process ID of the subprocess.
+    port: The port of the profiler server in the subprocess.
+
+  Returns:
+    A function that when called or garbage collected will unregister the
+    subprocess from the main process's profiler.
+
+  Raises:
+    RuntimeError: If the subprocess fails to be registered (e.g. already
+    registered, unable to connect, etc.).
+  """
+  return _profiler.register_subprocess(pid, port)
 
 
 class _ProfileState:
