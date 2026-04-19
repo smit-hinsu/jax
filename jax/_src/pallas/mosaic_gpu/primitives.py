@@ -4836,3 +4836,194 @@ def _semaphore_signal_multicast_lowering(
         mgpu_utils.memref_ptr(multi_ref), val, predicate=predicate
     )
   return ()
+
+semaphore_signal_p = jax_core.Primitive("semaphore_signal")
+semaphore_signal_p.multiple_results = True
+
+
+def semaphore_signal(
+    semaphore,
+    inc: int | jax.Array = 1,
+    *,
+    device_id: pallas_primitives.DeviceId | None = None,
+    device_id_type: pallas_primitives.DeviceIdType = (
+        pallas_primitives.DeviceIdType.MESH
+    ),
+    memory_scope: Literal["sys", "gpu"] = "sys",
+):
+  """Signals a semaphore, optionally on a remote device.
+
+  This is the MGPU specific variant of :func:`pallas.semaphore_signal`,
+  which additionally exposes the ``memory_scope`` of the underlying atomic.
+
+  Args:
+    semaphore: The semaphore reference to signal.
+    inc: The increment value for the semaphore.
+    device_id: Optional logical device id at which to signal the semaphore.
+    device_id_type: How to interpret ``device_id``.
+    memory_scope: The memory scope of the underlying atomic. Must be ``"sys"``
+      or ``"gpu"``. Defaults to ``"sys"``.
+  """
+  ref, transforms = pallas_primitives._get_ref_and_transforms(semaphore)
+  value = jnp.asarray(inc, dtype=jnp.int32)
+  args = [ref, transforms, value, device_id]
+  flat_args, args_tree = tree_util.tree_flatten(args)
+  semaphore_signal_p.bind(
+      *flat_args,
+      args_tree=args_tree,
+      device_id_type=device_id_type,
+      memory_scope=memory_scope,
+  )
+
+
+@semaphore_signal_p.def_effectful_abstract_eval
+def _semaphore_signal_abstract_eval(*avals, args_tree, device_id_type, memory_scope):
+  del device_id_type, memory_scope  # Unused.
+  sem_aval, sem_transforms_avals, value_aval, device_id_aval = (
+      tree_util.tree_unflatten(args_tree, avals)
+  )
+  pallas_primitives.check_sem_avals(
+      sem_aval, sem_transforms_avals, "semaphore_signal"
+  )
+  if value_aval.dtype != jnp.dtype("int32"):
+    raise ValueError(
+        f"Must signal an int32 value, but got {value_aval.dtype}"
+    )
+  effs: set[jax_core.Effect] = set()
+  if device_id_aval is not None:
+    flat_avals = tree_util.tree_leaves(device_id_aval)
+    if any(a.dtype != jnp.dtype("int32") for a in flat_avals):
+      raise ValueError(
+          "`device_id`s must be int32 values, but got"
+          f" {[a.dtype for a in flat_avals]}"
+      )
+    effs.add(gpu_core._sem_effect)
+  return [], effs
+
+
+@lowering.register_lowering_rule(semaphore_signal_p, mgpu.LoweringSemantics.Lane)
+@lowering.register_lowering_rule(semaphore_signal_p, mgpu.LoweringSemantics.Warpgroup)
+def _semaphore_signal_lowering(
+    ctx: lowering.LoweringRuleContext, *args, args_tree, device_id_type, memory_scope,
+):
+  i32 = ir.IntegerType.get_signless(32)
+  sem, transforms, value, device_id = tree_util.tree_unflatten(args_tree, args)
+  sem_aval, transform_avals, _, device_id_aval = tree_util.tree_unflatten(
+      args_tree, ctx.avals_in
+  )
+  assert isinstance(sem_aval, state_types.AbstractRef)
+  sem, _, transforms = lowering._handle_transforms(
+      ctx, sem_aval, sem, transform_avals, transforms
+  )
+  if transforms:
+    raise NotImplementedError(f"Unhandled transforms for semaphore_signal: {transforms}")
+  if device_id is not None:
+    if memory_scope == "gpu":
+      raise ValueError(
+          "Cannot signal a GPU-local semaphore from a remote device. Please use"
+          " `memory_scope='sys'` instead."
+      )
+    device_id = lowering._device_id_to_logical(
+        ctx, device_id, device_id_type, device_id_aval
+    )
+    assert device_id is not None
+    device_id = lowering._ensure_ir_value(device_id, jnp.int32)
+    sem = ctx.launch_ctx.to_remote(sem, device_id)
+
+  val = lowering._ir_constant(value, i32)
+  with lowering._wrap_in_custom_primitive_if_wg(ctx, [sem, val]) as [sem, val]:
+    sem_ptr = mgpu.utils.memref_ptr(sem)
+    # We only signal the semaphore from a single lane, which does not guarantee
+    # anything about the state of the other three warps in the warpgroup (they
+    # might still be e.g. reading memory that someone will overwrite once they
+    # receive a signal).
+    if ctx.module_ctx.auto_barriers:
+      mgpu.utils.warpgroup_barrier()
+    mgpu_utils.SemaphoreRef(sem_ptr).signal(
+        val,
+        predicate=ctx.module_ctx.single_wg_lane_predicate,
+        memory_scope=memory_scope,
+    )
+  return ()
+
+
+semaphore_wait_p = jax_core.Primitive("semaphore_wait")
+semaphore_wait_p.multiple_results = True
+
+
+def semaphore_wait(
+    semaphore,
+    value: int | jax.Array = 1,
+    *,
+    decrement: bool = True,
+    memory_scope: Literal["sys", "gpu"] = "sys",
+):
+  """Waits on a semaphore until it reaches at least ``value``.
+
+  This is the MGPU specific variant of :func:`pallas.semaphore_wait`,
+  which additionally exposes the ``memory_scope`` of the underlying atomic.
+
+  Args:
+    semaphore: The semaphore reference to wait on.
+    value: The target value that the semaphore should reach before unblocking.
+    decrement: Whether to decrement the semaphore by ``value`` once the wait
+      succeeds.
+    memory_scope: The memory scope of the underlying atomic. Must be ``"sys"``
+      or ``"gpu"``. Defaults to ``"sys"``.
+  """
+  ref, transforms = pallas_primitives._get_ref_and_transforms(semaphore)
+  value = jnp.asarray(value, dtype=jnp.int32)
+  args = [ref, transforms, value, decrement]
+  flat_args, args_tree = tree_util.tree_flatten(args)
+  semaphore_wait_p.bind(
+      *flat_args,
+      args_tree=args_tree,
+      memory_scope=memory_scope,
+  )
+
+
+@semaphore_wait_p.def_effectful_abstract_eval
+def _semaphore_wait_abstract_eval(*avals, args_tree, memory_scope):
+  del memory_scope  # Unused.
+  sem_aval, sem_transforms_avals, value_aval, _decrement = (
+      tree_util.tree_unflatten(args_tree, avals)
+  )
+  pallas_primitives.check_sem_avals(
+      sem_aval, sem_transforms_avals, "semaphore_wait"
+  )
+  if value_aval.dtype != jnp.dtype("int32"):
+    raise ValueError(f"Must wait on an int32 value, got {value_aval.dtype}")
+  return [], {gpu_core._sem_effect}
+
+
+@lowering.register_lowering_rule(semaphore_wait_p, mgpu.LoweringSemantics.Lane)
+@lowering.register_lowering_rule(semaphore_wait_p, *gpu_core.LANExWARP_SEMANTICS)
+@lowering.register_lowering_rule(semaphore_wait_p, mgpu.LoweringSemantics.Warpgroup)
+@lowering.register_lowering_rule(semaphore_wait_p, *gpu_core.WGxWARP_SEMANTICS)
+def _semaphore_wait_lowering(
+    ctx: lowering.LoweringRuleContext, *args, args_tree, memory_scope,
+):
+  sem, transforms, value, decrement = tree_util.tree_unflatten(args_tree, args)
+  sem_aval, transform_avals, *_ = tree_util.tree_unflatten(args_tree, ctx.avals_in)
+  assert isinstance(sem_aval, state_types.AbstractRef)
+  sem, _, transforms = lowering._handle_transforms(
+      ctx, sem_aval, sem, transform_avals, transforms
+  )
+  if transforms:
+    raise NotImplementedError(
+        f"Unhandled transforms for semaphore_wait: {transforms}"
+    )
+  val = lowering._ensure_ir_value(value, jnp.int32)
+
+  scope = mgpu_utils.ThreadSubset.WARPGROUP
+  if ctx.module_ctx.primitive_semantics == gpu_core.PrimitiveSemantics.Warp:
+    scope = mgpu_utils.ThreadSubset.WARP
+
+  with lowering._wrap_in_custom_primitive_if_wg(ctx, [sem, val]) as [sem, val]:
+    mgpu_utils.SemaphoreRef(mgpu.utils.memref_ptr(sem)).wait(
+        val,
+        decrement=decrement,
+        scope=scope,
+        memory_scope=memory_scope,
+    )
+  return ()

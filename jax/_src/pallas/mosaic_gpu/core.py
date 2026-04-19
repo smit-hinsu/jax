@@ -1613,3 +1613,13 @@ def TryClusterCancelResult(
     return SMEM((16,), jnp.int8)
   else:
     return SMEM((num_buffers, 16), jnp.int8)
+
+
+class SemaphoreEffect(jax_core.Effect):
+  pass
+
+
+_sem_effect = SemaphoreEffect()
+effects.control_flow_allowed_effects.add_type(SemaphoreEffect)
+effects.custom_derivatives_allowed_effects.add_type(SemaphoreEffect)
+pallas_core.kernel_local_effects.add_type(SemaphoreEffect)
