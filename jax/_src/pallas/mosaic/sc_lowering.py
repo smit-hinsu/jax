@@ -376,6 +376,7 @@ def lower_jaxpr_into_module(
     dynamic_shape_replacement_enabled: bool = False,
     mpmd_meshes: Mapping[tpu_core.CoreType, pallas_core.Mesh],
     needs_layout_passes: bool = False,
+    fuse_transposed_lhs_in_matmul: bool = False,
 ):
   """Lowers a Jaxpr to a Mosaic SparseCore module."""
   assert mpmd_meshes is not None, "mpmd_meshes must be provided."
@@ -429,6 +430,7 @@ def lower_jaxpr_into_module(
         backend=backend,
         dynamic_shape_replacement_fn=dynamic_shape_replacement_fn,
         mpmd_meshes=mpmd_meshes,
+        fuse_transposed_lhs_in_matmul=fuse_transposed_lhs_in_matmul,
     )
     assert mlir_func.verify(), mlir_func
     module.body.append(mlir_func)
@@ -486,6 +488,7 @@ def lower_jaxpr_to_func(
     forward_compatible: bool,
     backend: Any | None,
     needs_layout_passes: bool = False,
+    fuse_transposed_lhs_in_matmul: bool = False,
 ) -> func.FuncOp:
   """Lowers a Jaxpr to a Mosaic SparseCore function."""
   num_grid = len(mosaic_grid_mapping.grid_types)
@@ -532,6 +535,7 @@ def lower_jaxpr_to_func(
         dynamic_shape_replacement_fn=dynamic_shape_replacement_fn,
         mpmd_meshes=mosaic_grid_mapping.mpmd_meshes,
         needs_layout_passes=needs_layout_passes,
+        fuse_transposed_lhs_in_matmul=fuse_transposed_lhs_in_matmul,
     )
     return tc_lowering.jaxpr_subcomp(
           lowering_context, jaxpr, *scalar_prefetch, *operands_and_scratch

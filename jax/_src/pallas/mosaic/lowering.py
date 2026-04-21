@@ -15,7 +15,7 @@
 """Module for lowering JAX to Mosaic-compatible MLIR dialects."""
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Hashable, Sequence, Mapping
+from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
 import contextlib
 import dataclasses
 import functools
@@ -50,8 +50,8 @@ from jax._src.interpreters import partial_eval as pe
 from jax._src.lax import control_flow
 from jax._src.lax import lax as lax_internal
 from jax._src.lax.control_flow import BranchesPlatforms
-from jax._src.lib import xla_client
 from jax._src.lib import jax_mlir_ext, jaxlib_extension_version
+from jax._src.lib import xla_client
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import arith
 from jax._src.lib.mlir.dialects import cf
@@ -65,10 +65,10 @@ from jax._src.pallas import helpers as pallas_helpers
 from jax._src.pallas import primitives
 from jax._src.pallas import utils as pallas_utils
 from jax._src.pallas.mosaic import core as tpu_core
-from jax._src.pallas.mosaic import sc_core
 from jax._src.pallas.mosaic import error_handling
 from jax._src.pallas.mosaic import primitives as tpu_primitives
 from jax._src.pallas.mosaic import random as pl_random
+from jax._src.pallas.mosaic import sc_core
 from jax._src.pallas.mosaic import tpu_info
 from jax._src.state import indexing
 from jax._src.state import primitives as state_primitives
@@ -208,6 +208,7 @@ class LoweringContext:
   # TODO(rdyro): remove this once the ref mesh is available at trace time.
   # Meshes for devices this lowering can address.
   mpmd_meshes: Mapping[tpu_core.CoreType, pallas_core.Mesh]
+  fuse_transposed_lhs_in_matmul: bool
 
   replace = dataclasses.replace
 
@@ -791,6 +792,7 @@ def lower_jaxpr_to_module(
     mesh: mesh_lib.Mesh | None = None,
     dynamic_shape_replacement_enabled: bool = False,
     mpmd_meshes: Mapping[tpu_core.CoreType, pallas_core.Mesh],
+    fuse_transposed_lhs_in_matmul: bool = False,
 ) -> ir.Module:
   module = ir.Module.create()
   lower_jaxpr_into_module(
@@ -804,6 +806,7 @@ def lower_jaxpr_to_module(
       mesh=mesh,
       dynamic_shape_replacement_enabled=dynamic_shape_replacement_enabled,
       mpmd_meshes=mpmd_meshes,
+      fuse_transposed_lhs_in_matmul=fuse_transposed_lhs_in_matmul,
   )
   return module
 
@@ -820,6 +823,7 @@ def lower_jaxpr_into_module(
     mesh: mesh_lib.Mesh | None = None,
     dynamic_shape_replacement_enabled: bool = False,
     mpmd_meshes: Mapping[tpu_core.CoreType, pallas_core.Mesh],
+    fuse_transposed_lhs_in_matmul: bool = False,
 ) -> None:
   backend = lowering_context.module_context.get_backend(optional=True)
   # NOTE: We should bump this periodically
@@ -873,6 +877,7 @@ def lower_jaxpr_into_module(
       dynamic_shape_replacement_fn=dynamic_shape_replacement_fn,
       dynamic_shape_replacement_enabled=dynamic_shape_replacement_enabled,
       backend=backend,
+      fuse_transposed_lhs_in_matmul=fuse_transposed_lhs_in_matmul,
   )
   func_op.attributes["tpu.core_type"] = ir.Attribute.parse(
       f"#tpu.core_type<{kernel_type}>"
@@ -918,6 +923,7 @@ def lower_jaxpr_into_module(
           dynamic_shape_replacement_fn=dynamic_shape_replacement_fn,
           backend=backend,
           mpmd_meshes=mpmd_meshes,
+          fuse_transposed_lhs_in_matmul=fuse_transposed_lhs_in_matmul,
       )
       assert mlir_func.verify(), mlir_func
       block_shape = list(pallas_core._get_block_shape(bm.block_shape))
@@ -1126,6 +1132,7 @@ def lower_jaxpr_to_transform_func(
     backend: Any | None,
     dynamic_shape_replacement_fn: DynamicShapeReplacementFn,
     mpmd_meshes: Mapping[tpu_core.CoreType, pallas_core.Mesh],
+    fuse_transposed_lhs_in_matmul: bool,
 ) -> func.FuncOp:
   num_grid = len(mosaic_grid_mapping.grid_types)
   arg_types = [
@@ -1156,6 +1163,7 @@ def lower_jaxpr_to_transform_func(
         backend=backend,
         dynamic_shape_replacement_fn=dynamic_shape_replacement_fn,
         mpmd_meshes=mpmd_meshes,
+        fuse_transposed_lhs_in_matmul=fuse_transposed_lhs_in_matmul,
     )
     out = jaxpr_subcomp(lowering_context, jaxpr, *jaxpr_indices,
                         *scalar_prefetch)
@@ -1186,6 +1194,7 @@ def lower_jaxpr_to_func(
     backend: Any | None,
     dynamic_shape_replacement_fn: DynamicShapeReplacementFn,
     dynamic_shape_replacement_enabled: bool,
+    fuse_transposed_lhs_in_matmul: bool,
 ) -> func.FuncOp:
   num_grid = len(mosaic_grid_mapping.grid_types)
   num_scalar_prefetch = len(mosaic_grid_mapping.scalar_prefetch_types)
@@ -1220,6 +1229,7 @@ def lower_jaxpr_to_func(
         backend=backend,
         dynamic_shape_replacement_fn=dynamic_shape_replacement_fn,
         mpmd_meshes=mosaic_grid_mapping.mpmd_meshes,
+        fuse_transposed_lhs_in_matmul=fuse_transposed_lhs_in_matmul,
     )
     return jaxpr_subcomp(
         lowering_context, jaxpr, *scalar_prefetch, *operands_and_scratch
@@ -2422,14 +2432,30 @@ def _dot_general_lowering_rule(
   out_tile = arith.constant(
       out_type, ir.DenseElementsAttr.get_splat(out_type, val)
   )
-  return tpu.matmul(
-      out_type,
-      x,
-      y,
-      out_tile,
-      dimension_numbers=tpu_dot_dims,
-      precision=precision_attr,
-  )
+  if jaxlib_extension_version < 445 or TYPE_CHECKING:
+    return tpu.matmul(  # pyrefly: ignore[missing-argument]
+        out_type,
+        x,
+        y,
+        out_tile,
+        *[],  # To silence IDE warnings about missing arguments.
+        dimension_numbers=tpu_dot_dims,
+        precision=precision_attr,
+    )
+  else:
+    # Contracting on the second minor is to transpose the LHS.
+    transposed_lhs = (len(ctx.avals_in[0].shape) - 2) in dimension_numbers[0][0]
+    return tpu.matmul(
+        out_type,
+        x,
+        y,
+        out_tile,
+        dimension_numbers=tpu_dot_dims,
+        precision=precision_attr,
+        transpose_lhs_hint=not ctx.forward_compatible
+        and ctx.lowering_context.fuse_transposed_lhs_in_matmul
+        and transposed_lhs,
+    )
 
 
 def _convert_helper(x: Array, *, to_dtype: jnp.dtype) -> Array:
