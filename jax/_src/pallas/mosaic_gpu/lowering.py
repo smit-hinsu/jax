@@ -1722,6 +1722,8 @@ def _handle_transforms(
   new_transforms_avals = []
   peer_device_id = None
   is_multicast = False
+  cluster_dim = None
+  cluster_idx = None
 
   for t_aval, t in zip(transform_avals, transforms):
     match t:
@@ -1794,9 +1796,27 @@ def _handle_transforms(
               " primitive."
           )
         is_multicast = True
+      case gpu_core.ClusterRefTransform(dims, idxs):
+        if len(dims) != 1:
+          raise NotImplementedError(
+              "Only overriding a single cluster axis is supported for now."
+          )
+        cluster_dim = _resolve_cluster_axis(ctx.module_ctx.axis_names, dims[0])
+        cluster_idx = _as_index(idxs[0])
       case _:
         new_transforms.append(t)
         new_transforms_avals.append(t_aval)
+  if cluster_dim is not None:
+    assert cluster_idx is not None
+    if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Warpgroup:
+      i32 = ir.IntegerType.get_signless(32)
+      kwargs = dict(x=None, y=None, z=None)
+      kwargs[cluster_dim.name] = arith_dialect.index_cast(i32, cluster_idx)
+      transformed_ref = mgpu.dialect.get_cluster_ref(transformed_ref, **kwargs)
+    else:
+      transformed_ref = mgpu.get_cluster_ref(
+          transformed_ref, cluster_dim, cluster_idx, generic=False
+      )
   if peer_device_id is not None:
     assert not is_multicast
     if not allow_peer_refs:

@@ -334,6 +334,29 @@ def _optimization_barrier_op_lowering_rule(
   ]
 
 
+# TODO(apaszke): Remove once minimum supported jaxlib is 0.10.1
+if hasattr(mgpu, "GetClusterRefOp"):
+  @_register_lowering(mgpu.GetClusterRefOp)
+  def _get_cluster_ref_op_lowering_rule(
+      _: LoweringContext, op: mgpu.GetClusterRefOp,
+  ) -> Sequence[ir.Value]:
+    index = ir.IndexType.get()
+    specified_idxs = [
+        (d, dim) for d, dim in zip((op.x, op.y, op.z), gpu.Dimension)
+        if d is not None
+    ]
+    if len(specified_idxs) != 1:
+      raise ValueError(
+          "Exactly one cluster dimension must be specified, got"
+          f" {len(specified_idxs)}"
+      )
+    [(idx, dim)] = specified_idxs
+    result = utils.get_cluster_ref(
+        op.source, dim, arith.index_cast(index, idx), generic=False
+    )
+    return [result]
+
+
 @_register_lowering(arith.ConstantOp)
 def _arith_constant_op_lowering_rule(
     _: LoweringContext, op: arith.ConstantOp

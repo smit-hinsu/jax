@@ -118,7 +118,7 @@ class ValueSite:
     assert isinstance(ty, ir.MemRefType)
     if utils.is_tmem_ref(ty):
       return cs.MemorySpace.TMEM
-    elif utils.is_smem_ref(ty):
+    elif utils.is_smem_ref(ty) or utils.is_cluster_smem_ref(ty):
       return cs.MemorySpace.SMEM
     raise ValueError(f"Unsupported memory space for: {ty}")
 
@@ -1778,6 +1778,19 @@ def _slice_smem_constraint_system(
   else:
     result_variable = cs.Variable(result)
   return cs.ConstraintSystem(), {result_variable: [result]}
+
+
+# TODO(apaszke): Remove once minimum supported jaxlib is 0.10.1
+if hasattr(mgpu, "GetClusterRefOp"):
+  @_add_constraint_system_derivation_rule(mgpu.GetClusterRefOp)
+  def _get_cluster_ref_constraint_system(
+      ctx: DerivationContext,
+      op: mgpu.GetClusterRefOp,
+  ) -> ConstraintSystemDerivationRuleResult:
+    source = ValueSite(op, VariableType.OPERAND, 0)
+    var_source_dest = ctx.producer_ref(source)
+    dest = ValueSite(op, VariableType.RESULT, 0)
+    return cs.ConstraintSystem(), {var_source_dest: [source, dest]}
 
 
 @_add_constraint_system_derivation_rule(memref.SubViewOp)
