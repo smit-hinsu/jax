@@ -19,12 +19,13 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 import contextlib
 import functools
-from typing import cast, Any, ParamSpec, TypeVar
+from typing import Any, ParamSpec, TypeVar, cast
 
 from jax._src import api
 from jax._src import api_util
 from jax._src import config
 from jax._src import core as jax_core
+from jax._src import effects
 from jax._src import linear_util as lu
 from jax._src import state
 from jax._src import tree_util
@@ -34,9 +35,11 @@ from jax._src.interpreters import mlir
 from jax._src.interpreters import partial_eval as pe
 from jax._src.pallas import core as pallas_core
 from jax._src.pallas import pallas_call
+from jax._src.state import discharge as state_discharge
 
 
 _P = ParamSpec("_P")
+_Q = ParamSpec("_Q")
 _T = TypeVar("_T")
 
 
@@ -59,11 +62,40 @@ def _mpmd_map_abstract_eval(
     input_output_aliases,
     interpret,
     compiler_params,
+    meshes,
     **params,
 ):
   del params  # Unused.
 
   effs = {*pallas_core.get_interpret_effects(interpret)}
+  all_mesh_axis_names = {
+      eff.name
+      for jaxpr in jaxprs
+      for eff in jaxpr.effects
+      if isinstance(eff, jax_core.NamedAxisEffect)
+  }
+  for mesh, jaxpr in zip(meshes, jaxprs):
+    for eff in jaxpr.effects:
+      if mesh.discharges_effect(eff) or isinstance(
+          eff, pallas_core.CommsEffect
+      ):
+        continue
+      if pallas_core.kernel_local_effects.contains(eff):
+        continue
+      if isinstance(eff, effects.JaxprInputEffect):
+        # We emit an effect if we have a Ref input that has been written to in
+        # the kernel.
+        assert not jaxpr.constvars
+        if eff.input_index < len(in_avals) and isinstance(
+            in_avals[eff.input_index], state.AbstractRef
+        ):
+          effs.add(eff)
+        continue
+      if not isinstance(eff, jax_core.NamedAxisEffect):
+        effs.add(eff)
+        continue
+      if eff.name not in all_mesh_axis_names:
+        effs.add(eff)
   if getattr(compiler_params, "has_side_effects", False):
     # TODO(slebedev): Fix internal breakages and add
     # ``jax_core.GenericEffect(pallas_call_p)`` here.
@@ -103,11 +135,105 @@ def _mpmd_map_typecheck_rule(ctx_factory, *in_atoms, meshes, **params):
 jax_core.custom_typechecks[mpmd_map_p] = _mpmd_map_typecheck_rule
 
 
+def _mpmd_map_discharge_rule(
+    avals_in: Sequence[jax_core.AbstractValue],
+    avals_out: Sequence[jax_core.AbstractValue],
+    *args: Any,
+    jaxprs,
+    meshes,
+    input_output_aliases,
+    debug,
+    interpret,
+    compiler_params,
+    cost_estimate,
+    metadata,
+    name,
+    **_,
+):
+  write_indices = set()
+  for jaxpr in jaxprs:
+    for eff in jaxpr.effects:
+      if isinstance(eff, state.WriteEffect):
+        write_index = eff.input_index
+        if write_index < len(avals_in):
+          write_indices.add(write_index)
+
+  write_indices = sorted(write_indices)
+  num_in = len(avals_in)
+  num_out_orig = len(avals_out)
+  num_out_new = len(write_indices)
+
+  new_jaxprs = []
+
+  def _rewrite_to_include_new_outputs(jaxpr):
+
+    def new_body(*args):
+      in_refs, orig_out_refs, new_out_refs, scratch_refs = util.split_list(
+          args, [num_in, num_out_orig, num_out_new]
+      )
+      del new_out_refs
+      jax_core.eval_jaxpr(jaxpr, (), *(in_refs + orig_out_refs + scratch_refs))
+      return ()
+
+    all_in_avals = [v.aval for v in jaxpr.invars]
+    in_avals_trace, orig_out_avals_trace, scratch_avals_trace = util.split_list(
+        all_in_avals, [num_in, num_out_orig]
+    )
+    new_out_avals_trace = [avals_in[i] for i in write_indices]
+    tracing_avals = (
+        in_avals_trace
+        + orig_out_avals_trace
+        + new_out_avals_trace
+        + scratch_avals_trace
+    )
+
+    debug_info = api_util.debug_info(
+        "mpmd_map_discharge", new_body, tracing_avals, {}
+    )
+    wrapped_fun = lu.wrap_init(new_body, debug_info=debug_info)
+    new_jaxpr, _, _ = pe.trace_to_jaxpr_dynamic(wrapped_fun, tracing_avals)
+    return new_jaxpr
+
+  for jaxpr in jaxprs:
+    new_jaxprs.append(_rewrite_to_include_new_outputs(jaxpr))
+
+  new_out_avals = [avals_in[i].inner_aval for i in write_indices]
+  updated_out_avals = list(avals_out) + new_out_avals
+
+  new_aliases = dict(input_output_aliases)
+  for out_idx, in_idx in enumerate(write_indices):
+    new_aliases[in_idx] = num_out_orig + out_idx
+
+  res = mpmd_map_p.bind(
+      *args,
+      jaxprs=tuple(new_jaxprs),
+      meshes=meshes,
+      input_output_aliases=FrozenDict(new_aliases),
+      out_avals=tuple(updated_out_avals),
+      debug=debug,
+      interpret=interpret,
+      compiler_params=compiler_params,
+      cost_estimate=cost_estimate,
+      metadata=metadata,
+      name=name,
+  )
+
+  # Split the results into original outputs and updated refs.
+  ans, updated_refs = util.split_list(res, [num_out_orig])
+  new_invals = [None] * len(avals_in)
+  for out_idx, in_idx in enumerate(write_indices):
+    new_invals[in_idx] = updated_refs[out_idx]
+
+  return new_invals, ans
+
+
+state_discharge.register_discharge_rule(mpmd_map_p)(_mpmd_map_discharge_rule)
+
+
 def _mpmd_map_tpu_lowering(
     ctx: mlir.LoweringRuleContext,
     *in_nodes,
     jaxprs,
-    grid_mappings,
     meshes,
     input_output_aliases,
     debug,
@@ -122,12 +248,11 @@ def _mpmd_map_tpu_lowering(
     from jax._src.pallas.mosaic import pallas_call_registration
   except ImportError:
     raise pallas_call._unsupported_lowering_error("tpu")
-
+  num_scratch = len(jaxprs[0].invars) - len(in_nodes) - len(ctx.avals_out)
   return pallas_call_registration.mpmd_map_tpu_lowering_rule(
       ctx,
       *in_nodes,
       jaxprs=jaxprs,
-      grid_mappings=grid_mappings,
       meshes=meshes,
       input_output_aliases=input_output_aliases,
       debug=debug,
@@ -137,6 +262,7 @@ def _mpmd_map_tpu_lowering(
       out_avals=out_avals,
       metadata=metadata,
       name=name,
+      num_scratch=num_scratch,
   )
 
 
@@ -145,7 +271,6 @@ def _mpmd_map_fallback_lowering(
     *in_nodes,
     meshes,
     jaxprs,
-    grid_mappings,
     out_avals,
     input_output_aliases,
     compiler_params,
@@ -161,7 +286,6 @@ def _mpmd_map_fallback_lowering(
     )
   [jaxpr] = jaxprs
   [mesh] = meshes
-  [grid_mapping] = grid_mappings
 
   if hasattr(mesh, "dimension_semantics"):
     compiler_params = compiler_params.replace(
@@ -169,6 +293,44 @@ def _mpmd_map_fallback_lowering(
     )
   if hasattr(mesh, "core_type"):
     compiler_params = compiler_params.replace(kernel_type=mesh.core_type)
+
+  num_scratch = len(jaxpr.invars) - len(in_nodes) - len(out_avals)
+  scratch_avals = (
+      [v.aval for v in jaxpr.invars[-num_scratch:]] if num_scratch > 0 else []
+  )
+  scratch_types = tuple(
+      pallas_core.MemoryRef(v.inner_aval, v.memory_space) for v in scratch_avals
+  )
+
+  grid_spec = pallas_core.GridSpec(
+      grid=tuple(mesh.shape.items())
+      if isinstance(mesh.shape, Mapping)
+      else mesh.shape,
+      scratch_shapes=scratch_types,
+  )
+
+  in_tree = tree_util.tree_structure(in_nodes)
+  out_tree = tree_util.tree_structure(out_avals)
+
+  in_origins = [f"arg{i}" for i in range(len(in_nodes))]
+  out_origins = [f"out{i}" for i in range(len(out_avals))]
+
+  _, grid_mapping = pallas_core.get_grid_mapping(
+      grid_spec,
+      [
+          v.aval.inner_aval if isinstance(v.aval, state.AbstractRef) else v.aval
+          for v in jaxpr.invars[: len(in_nodes)]
+      ],
+      in_tree,
+      in_origins,
+      [
+          v.aval.inner_aval if isinstance(v.aval, state.AbstractRef) else v.aval
+          for v in jaxpr.invars[len(in_nodes) : len(in_nodes) + len(out_avals)]
+      ],
+      out_tree,
+      out_origins,
+      debug=debug,
+  )
 
   return pallas_call._pallas_call_lowering(
       ctx,
@@ -205,10 +367,17 @@ def _mpmd_map_lowering(ctx: mlir.LoweringRuleContext, *in_nodes, **params):
   )
 
 
+class NoOutType:
+  """A sentinel object to indicate that the function does not return any output."""
+
+
+no_out_type = NoOutType()
+
+
 def mpmd_map(
-    meshes_and_fns: Sequence[tuple[pallas_core.Mesh, Callable[_P, _T]]],
+    meshes_and_fns: Sequence[tuple[pallas_core.Mesh, Callable[_P, None]]],
     /,
-    out_types: tree_util.PyTree,
+    out_types: tree_util.PyTree | NoOutType = no_out_type,
     *,
     scratch_types: pallas_core.ScratchShapeTree = (),
     compiler_params: Any | None = None,
@@ -217,7 +386,7 @@ def mpmd_map(
     cost_estimate: pallas_core.CostEstimate | None = None,
     name: str | None = None,
     metadata: dict[str, str] | None = None,
-) -> Callable[_P, _T]:
+) -> Callable[_Q, _T]:
   return _mpmd_map(
       meshes_and_fns,
       out_types,
@@ -232,10 +401,154 @@ def mpmd_map(
   )
 
 
+def _aval_to_ref_aval(
+    aval: jax_core.AbstractValue | pallas_core.MemoryRef,
+    meshes: Sequence[pallas_core.Mesh],
+) -> state.AbstractRef:
+  match aval:
+    case state.AbstractRef():
+      return aval
+    case jax_core.ShapedArray(memory_space=memory_space):
+      if memory_space == jax_core.MemorySpace.Device:
+        defaults = {mesh.default_memory_space for mesh in meshes}
+        if len(defaults) != 1:
+          raise ValueError(
+              "Multiple meshes with different default memory spaces are not"
+              " supported."
+          )
+        memory_space = list(defaults)[0]
+      return state.AbstractRef(aval, memory_space=memory_space)
+    case pallas_core.MemoryRef():
+      return aval.get_ref_aval()
+    case _:
+      raise ValueError(f"Unsupported abstract value type: {type(aval), aval}")
+
+
+def _error_if_non_ref_consts(consts, debug_info):
+  consts_avals = [
+      aval
+      for c in consts
+      if not isinstance(aval := jax_core.typeof(c), state.AbstractRef)
+  ]
+  if consts_avals:
+    ctx = jax_core.JaxprPpContext()
+    pp_consts_avals = ", ".join(
+        jax_core.pp_aval(aval, ctx) for aval in consts_avals
+    )
+    raise ValueError(
+        "The kernel function in the mpmd_map"
+        f" {debug_info.func_src_info} captures non-Ref constants"
+        f" [{pp_consts_avals}]. You should pass them as inputs."
+    )
+
+
+def _get_unique_consts(
+    consts: Sequence[Sequence[Any]],
+) -> tuple[Sequence[Any], set[int]]:
+  unique_consts = []
+  unique_const_ids = set()
+  for cs in consts:
+    for c in cs:
+      if id(c) not in unique_const_ids:
+        unique_consts.append(c)
+        unique_const_ids.add(id(c))
+  return unique_consts, unique_const_ids
+
+
+def _dedup_consts_and_unify_jaxpr_signatures(
+    jaxprs: Sequence[jax_core.Jaxpr],
+    consts_per_fn: Sequence[Sequence[Any]],
+    flat_args: Sequence[Any],
+    unflat_in_avals: Sequence[jax_core.AbstractValue],
+    unflat_out_avals: Sequence[jax_core.AbstractValue],
+    flat_kernel_avals: Sequence[jax_core.AbstractValue],
+    super_mesh_shape: Mapping[str, int],
+) -> Sequence[jax_core.Jaxpr]:
+  # Example:
+  #   c1, c2, c3 are closed-over refs.
+  #   fn1 closes over [c1, c2] -> traced jaxpr1 has constvars for [c1, c2]
+  #   fn2 closes over [c2, c3] -> traced jaxpr2 has constvars for [c2, c3]
+  #
+  #   `_dedup_consts_and_unify_jaxpr_signatures` will:
+  #     1. Deduplicate constants to `unique_consts` = [c1, c2, c3].
+  #     2. Rewrite jaxprs to take all `unique_consts` as explicit inputs instead
+  #        of constvars:
+  #        new_jaxpr1: (in_args, c1, c2, c3, out_args, scratch_args) -> ()
+  #        new_jaxpr2: (in_args, c1, c2, c3, out_args, scratch_args) -> ()
+  #     3. Return the new jaxprs (with empty constvars) and `unique_consts`.
+
+  # Deduplicate constants
+  unique_consts, const_ids = _get_unique_consts(consts_per_fn)
+
+  # Check for aliasing with passed-in arguments
+  arg_ids = {id(arg) for arg in flat_args}
+  if any(const_id in arg_ids for const_id in const_ids):
+    raise NotImplementedError(
+        "Closed-over ref aliases with a passed-in ref is not supported."
+    )
+
+  unique_const_avals = [jax_core.typeof(c) for c in unique_consts]
+
+  # Split flat_kernel_avals to insert unique_consts in the correct position
+  # for discharge rule.
+  # Order in flat_kernel_avals: Inputs, Outputs, Scratch
+  num_inputs = len(tree_util.tree_leaves(unflat_in_avals))
+  num_outputs = len(tree_util.tree_leaves(unflat_out_avals))
+
+  in_avals_flat, out_avals_flat, scratch_avals_flat = util.split_list(
+      flat_kernel_avals, [num_inputs, num_outputs]
+  )
+
+  def make_rewritten_body(original_jaxpr, original_consts):
+    def _rewritten_body(*args):
+      in_args, unique_const_args, out_args, scratch_args = util.split_list(
+          args, [num_inputs, len(unique_consts), num_outputs]
+      )
+
+      # Extract only the consts used by this jaxpr.
+      c_map = {
+          id(uc): arg for uc, arg in zip(unique_consts, unique_const_args)
+      }
+      mapped_consts = [c_map[id(c)] for c in original_consts]
+
+      eval_args = in_args + out_args + scratch_args
+      jax_core.eval_jaxpr(original_jaxpr, mapped_consts, *eval_args)
+      return []
+
+    return _rewritten_body
+
+  # Rewrite jaxprs
+  new_jaxprs = []
+  tracing_avals = (
+      in_avals_flat
+      + unique_const_avals
+      + out_avals_flat
+      + scratch_avals_flat
+  )
+  for jaxpr, consts in zip(jaxprs, consts_per_fn):
+    debug_info = api_util.debug_info(
+        "mpmd_map_closed_over",
+        make_rewritten_body(jaxpr, consts),
+        tracing_avals,
+        {},
+    )
+    wrapped_fun = lu.wrap_init(
+        make_rewritten_body(jaxpr, consts), debug_info=debug_info
+    )
+    with (jax_core.extend_axis_env_nd(super_mesh_shape.items()),
+          config._check_vma(False)):
+      new_jaxpr, _, new_consts = pe.trace_to_jaxpr_dynamic(
+          wrapped_fun, tracing_avals
+      )
+    assert not new_consts
+    new_jaxprs.append(new_jaxpr)
+  return new_jaxprs, unique_consts
+
+
 def _mpmd_map(
-    meshes_and_fns: Sequence[tuple[pallas_core.Mesh, Callable[_P, _T]]],
+    meshes_and_fns: Sequence[tuple[pallas_core.Mesh, Callable[_P, None]]],
     /,
-    out_types: tree_util.PyTree,
+    out_types: tree_util.PyTree | NoOutType = no_out_type,
     *,
     input_output_aliases: Mapping[int, int] = {},
     scratch_types: pallas_core.ScratchShapeTree = (),
@@ -245,32 +558,35 @@ def _mpmd_map(
     cost_estimate: pallas_core.CostEstimate | None = None,
     name: str | None = None,
     metadata: dict[str, str] | None = None,
-) -> Callable[_P, _T]:
+) -> Callable[_Q, None]:
   """Like ``pallas_call``, but MPMD and without pipelining."""
   if not meshes_and_fns:
     raise ValueError("At least one mesh/function pair is required")
+  if out_types is no_out_type:
+    out_types = []
+  is_output_sequence = isinstance(out_types, (tuple, list))
 
   flat_out_types_with_paths, out_tree = tree_util.tree_flatten_with_path(
       out_types
   )
   out_paths, flat_out_types = util.unzip2(flat_out_types_with_paths)
+  # TODO(sharadmv): Use out_paths for debugging info.
+  del out_paths
   flat_out_avals = tuple(
       map(pallas_core._convert_out_shape_to_aval, flat_out_types)
   )
-  out_origins = tuple(f"outputs{tree_util.keystr(p)}" for p in out_paths)
 
   @functools.partial(api.jit, inline=True)
   def wrapper(*args):
     flat_args_with_paths, in_tree = tree_util.tree_flatten_with_path(args)
     in_paths, flat_args = util.unzip2(flat_args_with_paths)
+    del in_paths
+    # TODO(sharadmv): Use in_paths for debugging info.
     flat_avals = tuple(map(jax_core.typeof, flat_args))
-    in_origins = tuple(f"args{tree_util.keystr(p)}" for p in in_paths)
 
     # NOTE: ``grid_mapping`` are only needed for us to reuse the ``pallas_call``
     # lowering machinery.
-    meshes = []
-    jaxprs = []
-    grid_mappings = []
+    meshes = tuple(mesh for mesh, _ in meshes_and_fns)
 
     flat_scratch_types, scratch_tree = tree_util.tree_flatten(scratch_types)
     if len(meshes_and_fns) > 1:
@@ -302,64 +618,48 @@ def _mpmd_map(
         mesh.check_is_compatible_with(other_mesh)
 
     super_mesh_shape = {}
-    for mesh, _ in meshes_and_fns:
+    for mesh in meshes:
       for k, v in mesh.shape.items():
         # An extra check since `check_is_compatible_with` should catch it.
         assert k not in super_mesh_shape or super_mesh_shape[k] == v, (
             f"Conflicting size for axis {k}"
         )
         super_mesh_shape[k] = v
-
-    for mesh, fn in meshes_and_fns:
-      grid_spec = pallas_core.GridSpec(
-          grid=tuple(mesh.shape.items()),  # pyrefly: ignore[bad-argument-type]
-          in_specs=in_tree.unflatten(
-              pallas_core.BlockSpec(
-                  memory_space=aval.memory_space
-                  if isinstance(aval, jax_core.ShapedArray)
-                  and not isinstance(aval.memory_space, jax_core.MemorySpace)
-                  else mesh.default_memory_space,
-              )
-              for aval in flat_avals
-          ),
-          out_specs=out_tree.unflatten(
-              pallas_core.BlockSpec(
-                  memory_space=aval.memory_space
-                  if isinstance(aval, jax_core.ShapedArray)
-                  and not isinstance(aval.memory_space, jax_core.MemorySpace)
-                  else mesh.default_memory_space,
-              )
-              for aval in flat_out_avals
-          ),
-          scratch_shapes=flat_scratch_types,
-      )
-      kernel_args, grid_mapping = pallas_core.get_grid_mapping(
-          grid_spec,
-          flat_avals,
-          in_tree,
-          in_origins,
-          flat_out_avals,
-          out_tree,
-          out_origins,
-      )
-      kernel_args, scratch_args = util.split_list(
-          kernel_args, [len(kernel_args) - scratch_tree.num_leaves])
-      scratch_args = scratch_tree.unflatten(scratch_args)
-      if isinstance(scratch_args, dict):
-        kernel_args_kwargs = (kernel_args, scratch_args)
+    unflat_in_avals = in_tree.unflatten(flat_avals)
+    unflat_out_avals = out_tree.unflatten(flat_out_avals)
+    unflat_scratch_types = scratch_tree.unflatten(flat_scratch_types)
+    if isinstance(unflat_scratch_types, Mapping):
+      kernel_args = (*unflat_in_avals,)
+      if is_output_sequence:
+        kernel_args += (*unflat_out_avals,)
       else:
-        kernel_args_kwargs = (kernel_args + list(scratch_args), {})
-      flat_kernel_avals, kernel_in_tree = tree_util.tree_flatten(
-          kernel_args_kwargs)
-      debug_info = api_util.debug_info(
-          "mpmd_map",
-          fn,
-          *kernel_args_kwargs,
-      )
+        kernel_args += (unflat_out_avals,)
+      kernel_kwargs = unflat_scratch_types
+    else:
+      kernel_args = (*unflat_in_avals,)
+      if is_output_sequence:
+        kernel_args += (*unflat_out_avals,)
+      else:
+        kernel_args += (unflat_out_avals,)
+      kernel_args += tuple(unflat_scratch_types)
+      kernel_kwargs = {}
+
+    unflat_kernel_avals = tree_util.tree_map(
+        functools.partial(_aval_to_ref_aval, meshes=meshes),
+        (kernel_args, kernel_kwargs),
+    )
+    flat_kernel_avals, kernel_aval_tree = tree_util.tree_flatten(
+        unflat_kernel_avals
+    )
+
+    jaxprs = []
+    consts_per_fn = []
+    for _, fn in meshes_and_fns:
+      debug_info = api_util.debug_info("mpmd_map", fn, flat_kernel_avals, {})
       if name is not None:
         debug_info = debug_info.replace_func_name(name)
       flat_fun, out_tree_thunk = api_util.flatten_fun(
-          lu.wrap_init(fn, debug_info=debug_info), kernel_in_tree
+          lu.wrap_init(fn, debug_info=debug_info), kernel_aval_tree
       )
       with (jax_core.extend_axis_env_nd(super_mesh_shape.items()),
             config._check_vma(False)):
@@ -373,11 +673,24 @@ def _mpmd_map(
             f" should return None. It returns a PyTree: {fun_out_tree}."
         )
       if consts:
-        raise NotImplementedError("MPMD kernels cannot close over constants")
-
-      meshes.append(mesh)
+        _error_if_non_ref_consts(consts, debug_info)
       jaxprs.append(jaxpr)
-      grid_mappings.append(grid_mapping)
+      consts_per_fn.append(consts)
+
+    if any(consts_per_fn):
+      # If we close over any constants in the kernel functions, we need to
+      # deduplicate them and then unify the jaxpr signatures.
+      jaxprs, consts = _dedup_consts_and_unify_jaxpr_signatures(
+          jaxprs, consts_per_fn, flat_args, unflat_in_avals, unflat_out_avals,
+          flat_kernel_avals, super_mesh_shape
+      )
+    else:
+      consts = []
+
+    if debug:
+      for mesh, jaxpr in zip(meshes, jaxprs):
+        print(f"jaxpr for {mesh.core_type}")
+        print(jaxpr)
 
     # TODO(slebedev): The named scope should not be necessary here.
     ctx = (
@@ -386,9 +699,9 @@ def _mpmd_map(
     with ctx:
       flat_outs = mpmd_map_p.bind(
           *flat_args,
+          *consts,
           meshes=tuple(meshes),
           jaxprs=tuple(jaxprs),
-          grid_mappings=tuple(grid_mappings),
           out_avals=flat_out_avals,
           input_output_aliases=FrozenDict(input_output_aliases),
           compiler_params=compiler_params,

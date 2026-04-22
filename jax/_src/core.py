@@ -2843,6 +2843,8 @@ ref_p.to_lojax = _ref_to_lojax
 @ref_p.def_effectful_abstract_eval
 def _ref_abstract_eval(init_aval, *, memory_space: Any, kind: Any):
   from jax._src.state.types import AbstractRef  # pyrefly: ignore[missing-import]
+  if isinstance(init_aval, ShapedArray) and memory_space is not None:
+    init_aval = init_aval.update(memory_space=memory_space)
   return (AbstractRef(init_aval, memory_space=memory_space, kind=kind),
           {internal_mutable_array_effect})
 

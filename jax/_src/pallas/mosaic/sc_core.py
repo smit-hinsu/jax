@@ -190,8 +190,8 @@ class ScalarSubcoreMesh(pallas_core.Mesh):
     return self.num_cores
 
   @property
-  def dimension_semantics(self) -> Sequence[str]:
-    return ["core_parallel"]
+  def dimension_semantics(self) -> Sequence[tpu_core.DimensionSemantics]:
+    return [tpu_core.GridDimensionSemantics.CORE_PARALLEL]
 
   def discharges_effect(self, effect):
     del effect  # Unused.
@@ -313,8 +313,11 @@ class VectorSubcoreMesh(pallas_core.Mesh):
     return self.num_cores * self.num_subcores
 
   @property
-  def dimension_semantics(self) -> Sequence[str]:
-    return ["core_parallel", "subcore_parallel"]
+  def dimension_semantics(self) -> Sequence[tpu_core.DimensionSemantics]:
+    return [
+        tpu_core.GridDimensionSemantics.CORE_PARALLEL,
+        tpu_core.GridDimensionSemantics.SUBCORE_PARALLEL,
+    ]
 
   def discharges_effect(self, effect):
     del effect  # Unused.

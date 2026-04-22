@@ -27,7 +27,6 @@ import hypothesis.strategies as hps
 import jax
 from jax import lax
 from jax._src import hypothesis_test_util as htu
-from jax._src import mesh as mesh_lib
 from jax._src import test_util as jtu
 from jax._src.pallas import mpmd
 from jax._src.pallas.mosaic import sc_core
@@ -57,7 +56,7 @@ class PallasSCMeshTest(jtu.JaxTestCase):
     self.assertEqual(
         mesh.shape, collections.OrderedDict({"x": sc_info.num_cores})
     )
-    self.assertEqual(mesh.dimension_semantics, ["core_parallel"])
+    self.assertEqual(mesh.dimension_semantics, [pltpu.CORE_PARALLEL])
     self.assertEqual(mesh.default_memory_space, pltpu.MemorySpace.HBM)
 
   def test_vector_subcore_mesh(self):
@@ -74,7 +73,7 @@ class PallasSCMeshTest(jtu.JaxTestCase):
         collections.OrderedDict({"x": num_cores, "y": 1}),
     )
     self.assertEqual(
-        mesh.dimension_semantics, ["core_parallel", "subcore_parallel"]
+        mesh.dimension_semantics, [pltpu.CORE_PARALLEL, pltpu.SUBCORE_PARALLEL]
     )
     self.assertEqual(mesh.default_memory_space, pltpu.MemorySpace.HBM)
 
@@ -2484,6 +2483,166 @@ class MpmdMapTest(PallasSCTest):
     np.testing.assert_array_equal(out[:x.size], x + 2 * x)
     np.testing.assert_array_equal(out[x.size:], x + 3 * x)
 
+  def test_passing_in_refs(self):
+    s_mesh = plsc.ScalarSubcoreMesh(
+        axis_name="s_core", num_cores=self.sc_info.num_cores
+    )
+
+    x = jnp.arange(8 * 128, dtype=jnp.int32).reshape(8, 128)
+
+    @jax.jit
+    def f(x):
+      x_ref = jax.new_ref(x)
+      o_ref = jax.empty_ref(jax.typeof(x))
+      mpmd.mpmd_map(
+          [(s_mesh, pltpu.sync_copy)],
+      )(x_ref, o_ref)
+      return jax.freeze(o_ref)
+    np.testing.assert_array_equal(x, f(x))
+
+  def test_passing_in_multiple_refs(self):
+    s_mesh = plsc.ScalarSubcoreMesh(
+        axis_name="s_core", num_cores=self.sc_info.num_cores
+    )
+    x = jnp.arange(8 * 128, dtype=jnp.int32).reshape(8, 128)
+    y = jnp.zeros_like(x)
+
+    @jax.jit
+    def f(x, y):
+      x_ref = jax.new_ref(x)
+      y_ref = jax.new_ref(y)
+
+      def scalar_subcore_fn(x_ref, y_ref, scratch_x, scratch_y):
+        pltpu.sync_copy(x_ref, scratch_x)
+        pltpu.sync_copy(y_ref, scratch_y)
+        pltpu.sync_copy(scratch_x, y_ref)
+        pltpu.sync_copy(scratch_y, x_ref)
+
+      mpmd.mpmd_map(
+          [(s_mesh, scalar_subcore_fn)],
+          scratch_types=(pltpu.SMEM(x.shape, x.dtype), pltpu.SMEM(y.shape, y.dtype)),
+      )(x_ref, y_ref)
+      return jax.freeze(x_ref), jax.freeze(y_ref)
+
+    out_x, out_y = f(x, y)
+    np.testing.assert_array_equal(out_x, y)
+    np.testing.assert_array_equal(out_y, x)
+
+  def test_mixed_outputs_and_refs(self):
+    v_mesh = plsc.VectorSubcoreMesh(
+        core_axis_name="s_core",
+        subcore_axis_name="subcore",
+        num_cores=1,
+        num_subcores=1,
+    )
+    x = jnp.arange(8 * 128, dtype=jnp.int32).reshape(8, 128)
+
+    @jax.jit
+    def f(x):
+      x_ref = jax.new_ref(x)
+
+      def subcore_fn(x_ref, out_ref, scratch_ref):
+        pltpu.sync_copy(x_ref, out_ref)
+        pltpu.sync_copy(x_ref, scratch_ref)
+        scratch_ref[0, :8] += jnp.ones(8, dtype=jnp.int32)
+        pltpu.sync_copy(scratch_ref, x_ref)
+
+      out = mpmd.mpmd_map(
+          [(v_mesh, subcore_fn)],
+          out_types=jax.typeof(x),
+          scratch_types=(pltpu.VMEM(x.shape, x.dtype),),
+      )(x_ref)
+      return out, jax.freeze(x_ref)
+
+    out, mutated_x = f(x)
+    np.testing.assert_array_equal(out, x)
+    np.testing.assert_array_equal(mutated_x, x.at[0, :8].add(1))
+
+  def test_passing_in_refs_read_only(self):
+    s_mesh = plsc.ScalarSubcoreMesh(
+        axis_name="s_core", num_cores=self.sc_info.num_cores
+    )
+    x = jnp.arange(8 * 128, dtype=jnp.int32).reshape(8, 128)
+
+    @jax.jit
+    def f(x):
+      x_ref = jax.new_ref(x)
+
+      # Nothing should happen.
+      def scalar_subcore_fn(_):
+        pass
+      mpmd.mpmd_map([(s_mesh, scalar_subcore_fn)])(x_ref)
+      return jax.freeze(x_ref)
+
+    np.testing.assert_array_equal(x, f(x))
+
+  def test_passing_in_refs_with_scratch(self):
+    s_mesh = plsc.ScalarSubcoreMesh(
+        axis_name="s_core", num_cores=self.sc_info.num_cores
+    )
+    x = jnp.arange(8 * 128, dtype=jnp.int32).reshape(8, 128)
+
+    @jax.jit
+    def f(x):
+      x_ref = jax.new_ref(x)
+      o_ref = jax.empty_ref(jax.typeof(x))
+
+      def scalar_subcore_fn(x_hbm_ref, out_hbm_ref, scratch_ref):
+        pltpu.sync_copy(x_hbm_ref, scratch_ref)
+        pltpu.sync_copy(scratch_ref, out_hbm_ref)
+
+      mpmd.mpmd_map(
+          [(s_mesh, scalar_subcore_fn)],
+          scratch_types=(pltpu.SMEM(x.shape, x.dtype),),
+      )(x_ref, o_ref)
+      return jax.freeze(o_ref)
+
+    np.testing.assert_array_equal(x, f(x))
+
+  def test_closed_over_refs(self):
+    s_mesh = plsc.ScalarSubcoreMesh(
+        axis_name="s_core", num_cores=self.sc_info.num_cores
+    )
+    x = jnp.arange(8 * 128, dtype=jnp.int32).reshape(8, 128)
+
+    @jax.jit
+    def f(x):
+      x_ref = jax.new_ref(x)
+      o_ref = jax.empty_ref(jax.typeof(x))
+
+      def scalar_subcore_fn():
+        pltpu.sync_copy(x_ref, o_ref)
+
+      mpmd.mpmd_map(
+          [(s_mesh, scalar_subcore_fn)],
+      )()
+      return jax.freeze(o_ref)
+
+    np.testing.assert_array_equal(x, f(x))
+
+  def test_closed_over_refs_with_scratch(self):
+    s_mesh = plsc.ScalarSubcoreMesh(
+        axis_name="s_core", num_cores=self.sc_info.num_cores
+    )
+    x = jnp.arange(8 * 128, dtype=jnp.int32).reshape(8, 128)
+
+    @jax.jit
+    def f(x):
+      x_ref = jax.new_ref(x)
+      o_ref = jax.empty_ref(jax.typeof(x))
+
+      def scalar_subcore_fn(scratch_ref):
+        pltpu.sync_copy(x_ref, scratch_ref)
+        pltpu.sync_copy(scratch_ref, o_ref)
+
+      mpmd.mpmd_map(
+          [(s_mesh, scalar_subcore_fn)],
+          scratch_types=(pltpu.SMEM(x.shape, x.dtype),),
+      )()
+      return jax.freeze(o_ref)
+
+    np.testing.assert_array_equal(x, f(x))
+
   @parameterized.product(
       use_tc_tiling=(False, True), full_core_spec=(True, False),
       signalling_direction=("scs_to_tec", "tec_to_scs", "both"),
@@ -3018,7 +3177,7 @@ class PallasTpuSparseCoreLoweringErrorTest(jtu.JaxTestCase):
         kernel.lower(x).compile()
 
   def test_mpmd_map_sparsecore_availability_check(self):
-    mesh = mock.MagicMock(spec=mesh_lib.AbstractMesh)
+    mesh = mock.MagicMock()
     mesh.devices = tuple(jax.devices()[:1])
     mesh.axis_names = ("x",)
     mesh.axis_sizes = {"x": 1}
