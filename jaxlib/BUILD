@@ -1341,6 +1341,7 @@ cc_library(
         "@nanobind",
         "@xla//third_party/python_runtime:headers",  # buildcleaner: keep
         "@xla//xla/pjrt:exceptions",
+        "@xla//xla/python:safe_static_init",
     ],
 )
 

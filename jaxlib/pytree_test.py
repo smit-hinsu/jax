@@ -139,6 +139,29 @@ class PyTreeTest(absltest.TestCase):
         gc.get_referents(treedef),
     )
 
+  def testGeneratorWarning(self):
+    def gen():
+      yield 1
+    g = gen()
+    with self.assertWarnsRegex(
+        UserWarning, "Python generators are treated as leaves in PyTree."):
+      registry.flatten(g)
+
+  # TODO(rdyro): Remove this test when dict_values becomes an error.
+  def testDictValuesWarning(self):
+    d = {"a": 1, "b": 2}
+    v = d.values()
+    with self.assertWarnsRegex(
+        DeprecationWarning,
+        "Python dict_values are treated as leaves in PyTree."):
+      registry.flatten(v)
+
+  def testDictValuesWithLeafPredicate(self):
+    d = {"a": 1, "b": 2}
+    v = d.values()
+    dict_values_type = type(v)
+    leaves, _ = registry.flatten(v, lambda x: isinstance(x, dict_values_type))
+    self.assertEqual(leaves, [v])
 
 if __name__ == "__main__":
   absltest.main()

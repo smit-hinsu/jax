@@ -56,6 +56,7 @@ limitations under the License.
 #include "jaxlib/nb_class_ptr.h"
 #include "jaxlib/pytree.pb.h"
 #include "xla/pjrt/exceptions.h"
+#include "xla/python/safe_static_init.h"
 
 namespace jax {
 
@@ -739,6 +740,28 @@ void PyTreeDef::FlattenImpl(nb::handle handle, T& leaves,
       }
       default:
         DCHECK(node.kind == PyTreeKind::kLeaf);
+        {
+          static xla::SafeStatic<nb::object> dict_values_type;
+          auto get_dict_values_type = []() {
+            nb::object d = nb::dict();
+            return std::make_unique<nb::object>(
+                nb::steal(PyObject_Type(d.attr("values")().ptr())));
+          };
+          nb::object& type_obj = dict_values_type.Get(get_dict_values_type);
+
+          if (PyObject_TypeCheck(handle.ptr(), (PyTypeObject*)type_obj.ptr())) {
+            if (PyErr_WarnEx(PyExc_DeprecationWarning,
+                "Python dict_values are treated as leaves in PyTree.", 1) < 0) {
+              throw nb::python_error();
+            }
+          }
+          if (PyGen_Check(handle.ptr())) {
+            if (PyErr_WarnEx(PyExc_UserWarning,
+                "Python generators are treated as leaves in PyTree.", 1) < 0) {
+              throw nb::python_error();
+            }
+          }
+        }
         auto value = nb::borrow<nb::object>(handle);
         if (keypath.has_value()) {
           auto kp_tuple = MakeKeyPathTuple(keypath.value());
