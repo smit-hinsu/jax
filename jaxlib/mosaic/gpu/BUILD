@@ -367,6 +367,7 @@ cc_library(
         "@xla//xla/backends/gpu/runtime:collective_memory_requests",
         "@xla//xla/backends/gpu/runtime:collective_params",
         "@xla//xla/core/collectives:rank_id",
+        "@xla//xla/core/collectives:symmetric_memory",
         "@xla//xla/ffi",
         "@xla//xla/ffi:type_registry",
         "@xla//xla/service/gpu/llvm_gpu_backend:nvptx_libdevice_path",
@@ -382,6 +383,7 @@ cc_library(
         "@xla//xla/tsl/platform:errors",
         "@xla//xla/tsl/platform:logging",
         "@xla//xla/tsl/platform:statusor",
+        "@xla//xla/tsl/util:tied_ref",
     ],
     alwayslink = True,
 )
