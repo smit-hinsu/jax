@@ -1781,6 +1781,7 @@ def _memref_subview_op_lowering_rule(
   if swizzle != mgpu.SwizzlingMode.kNoSwizzle:
     swizzle_elems = swizzle * 8 // utils.bitwidth(src_ty.element_type)
     source_strides, _ = src_ty.get_strides_and_offset()
+    dyn_offset_index = 0
     for stride, offset, size in zip(
         source_strides, op.static_offsets, op.static_sizes, strict=True
     ):
@@ -1792,13 +1793,14 @@ def _memref_subview_op_lowering_rule(
             f"Swizzled dimension of {size=} is not a multiple of"
             f" {swizzle_elems=}."
         )
-      # TODO(allanrenucci): Support dynamic offsets that are divisible by
-      # `swizzle_elems`. E.g. using `utils.is_known_divisible`.
       if ir.ShapedType.is_dynamic_size(offset):
-        raise NotImplementedError(
-            "Slicing a swizzled dynamic dimension is not supported."
+        dyn_offset = op.offsets[dyn_offset_index]
+        dyn_offset_index += 1
+        if not utils.is_known_divisible(dyn_offset, swizzle_elems):
+          raise ValueError(
+            f"Dynamic subview is not a multiple of {swizzle_elems=}."
         )
-      if offset % swizzle_elems != 0:
+      elif offset % swizzle_elems != 0:
         raise ValueError(
             f"subview {offset=} is not a multiple of {swizzle_elems=}."
         )
