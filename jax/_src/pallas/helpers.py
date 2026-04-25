@@ -13,7 +13,7 @@
 # limitations under the License.
 """Pallas helper functions."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 import functools
 from typing import Any, TypeVar, cast, overload
 from collections.abc import Hashable
@@ -25,10 +25,10 @@ from jax._src import core as jax_core
 from jax._src import numpy as jnp
 from jax._src import tree_util
 from jax._src import typing as jax_typing
-from jax._src import util
 import jax._src.lax as lax
 from jax._src.lax.control_flow import conditionals
 from jax._src.pallas import core as pl_core
+from jax._src.pallas import mpmd
 from jax._src.pallas import primitives as pl_primitives
 from jax._src.pallas import utils as pl_utils
 
@@ -179,60 +179,42 @@ def debug_check(condition, message):
   """
   return checkify.debug_check(condition, message)
 
-def _get_empty_ref(out):
-  aval = pl_core._convert_out_shape_to_aval(out)
-  mem_space = (None if isinstance(aval.memory_space, jax_core.MemorySpace)  # type: ignore
-               else aval.memory_space)  # type: ignore
-  val = lax.empty(aval.shape, aval.dtype, out_sharding=aval.sharding,  # type: ignore
-                  _manual_axis_type=aval.manual_axis_type)  # type: ignore
-  return jax_core.new_ref(val, memory_space=mem_space)
-
-
-def _make_kernel(body,
+def _make_kernel(meshes_and_fns: Sequence[tuple[pl_core.Mesh, Callable]],
                  out_type: object,
-                 mesh: pl_core.Mesh,
                  scratch_types: pl_core.ScratchShapeTree = (),
                  name: str | None = None,
                  **mesh_kwargs
                  ):
-  if unwrap_out := not isinstance(out_type, (tuple, list)):
-    out_type = (out_type,)
-
-  @api.jit
   def wrapper(*operands):
-    arg_refs = tree_util.tree_map(jax_core.new_ref, operands)
-    out_refs = tree_util.tree_map(_get_empty_ref, out_type)
-
-    @pl_core.core_map(
-        mesh,
-        scratch_shapes=scratch_types,
+    return mpmd.mpmd_map(
+        meshes_and_fns,
+        out_types=out_type,
+        scratch_types=scratch_types,
+        name=name,
         **mesh_kwargs,
-        name=name or util.fun_name(body),
-    )
-    def _(*scratch_refs, **scratch_kwrefs):
-      return body(*arg_refs, *out_refs, *scratch_refs, **scratch_kwrefs)
-
-    outs = tree_util.tree_map(lambda ref: ref[...], out_refs)
-    return outs[0] if unwrap_out else outs
+    )(*operands)
   return wrapper
 
 
-def kernel(body: Callable | api.NotSpecified = api.NotSpecified(),
-           out_type: object | None = None,
-           *,
-           mesh: pl_core.Mesh,
-           scratch_types: pl_core.ScratchShapeTree = (),
-           compiler_params: pl_core.CompilerParams | None = None,
-           interpret: bool = False,
-           cost_estimate: pl_core.CostEstimate | None = None,
-           debug: bool = False,
-           name: str | None = None,
-           metadata: dict[str, str] | None = None,
+def kernel(
+    body: (
+        Callable | Sequence[Callable],
+    ) = api.NotSpecified(),
+    out_type: object | None = (),
+    *,
+    mesh: pl_core.Mesh | Sequence[pl_core.Mesh],
+    scratch_types: pl_core.ScratchShapeTree = (),
+    compiler_params: pl_core.CompilerParams | None = None,
+    interpret: bool = False,
+    cost_estimate: pl_core.CostEstimate | None = None,
+    debug: bool = False,
+    name: str | None = None,
+    metadata: dict[str, str] | None = None,
 ):
   """Entry point for creating a Pallas kernel.
 
-  This is a convenience wrapper around ``core_map`` for executing a kernel
-  over a mesh and ``run_scoped`` for allocating scratch memory.
+  This is a convenience wrapper around ``mpmd_map`` for executing a kernel
+  over a mesh.
 
   If ``body`` is provided, this function behaves as a decorator:
 
@@ -240,24 +222,37 @@ def kernel(body: Callable | api.NotSpecified = api.NotSpecified(),
 
     def kernel_body(in_ref, out_ref):
       ...
-    kernel = pl.kernel(kernel_body, out_shape=...)
+    kernel = pl.kernel(kernel_body, out_type=...)
 
   If ``body`` is omitted, this function behaves as a decorator factory and
   will return a decorator that can be used to annotate a kernel body:
 
   .. code-block:: python
 
-    @pl.kernel(out_shape=...)
+    @pl.kernel(mesh=..., out_type=...)
     def kernel(in_ref, out_ref):
       ...
+
+  For MPMD kernels, you can pass parallel lists of bodies and meshes:
+
+  .. code-block:: python
+
+    my_kernel = pl.kernel(
+        body=[vector_fn, scalar_fn],
+        mesh=[v_mesh, s_mesh],
+        out_type=...
+    )
 
   Args:
     body: The body of the kernel. If provided, this function behaves as a
       decorator, and if omitted, this function behaves as a decorator factory.
-    out_shape: The shape of the output. Should be a PyTree of
-      ``jax.ShapeDtypeStruct`` or ``jax.Array`` s.
-    mesh: The mesh to run the kernel on.
-    scratch_shapes: The shapes of the scratch arrays.
+      Can also be a sequence of callables to be paired with a sequence of
+      meshes.
+    out_type: The type of the output. Should be a PyTree of
+      ``jax.ShapeDtypeStruct`` or JAX types.
+    mesh: The mesh to run the kernel on. Must be a sequence of meshes if
+      ``body`` is a sequence of callables.
+    scratch_types: The shapes of the scratch arrays.
     compiler_params: The compiler parameters to pass to the backend.
     interpret: Whether to run the function in interpret mode.
     debug: Whether or not to out helpful debugging information.
@@ -269,17 +264,14 @@ def kernel(body: Callable | api.NotSpecified = api.NotSpecified(),
   Returns:
     If ``body`` is provided, returns a function that runs the kernel.
     It should take any number of input operands and returns an output with the
-    same PyTree structure as `out_shape`.
+    same PyTree structure as `out_type`.
     If ``body`` is omitted, returns a decorator that can be used to annotate
     a kernel body.
   """
   # Note we default out_shape to None to allow `body` to come before it
   # in the function signature, but `body` itself is optional.
-  if out_type is None:
-    raise ValueError('out_type must be provided.')
   kwds = dict(
       out_type=out_type,
-      mesh=mesh,
       scratch_types=scratch_types,
       compiler_params=compiler_params,
       interpret=interpret,
@@ -288,9 +280,27 @@ def kernel(body: Callable | api.NotSpecified = api.NotSpecified(),
       name=name,
       metadata=metadata)
   if isinstance(body, api.NotSpecified):
-    return lambda fun: _make_kernel(fun, **kwds)
+    if isinstance(mesh, Sequence):
+      raise ValueError(
+          "mesh cannot be a sequence when using pl.kernel as a decorator."
+      )
+    return lambda fun: _make_kernel([(mesh, fun)], **kwds)
+  elif isinstance(body, Sequence):
+    if not isinstance(mesh, Sequence):
+      raise ValueError(
+          "mesh must be a sequence when body is a sequence of callables."
+      )
+    if len(body) != len(mesh):
+      raise ValueError("body and mesh sequences must have the same length.")
+    meshes_and_fns = list(zip(mesh, body))
+    return _make_kernel(meshes_and_fns, **kwds)
   else:
-    return _make_kernel(body, **kwds)
+    # Case 3: body is a single callable
+    if isinstance(mesh, Sequence):
+      raise ValueError(
+          "mesh cannot be a sequence when body is a single callable."
+      )
+    return _make_kernel([(mesh, body)], **kwds)
 
 
 def with_scoped(
