@@ -371,7 +371,7 @@ class CoreMapTest(jtu.JaxTestCase):
 
     x = jnp.arange(8 * 128, dtype=jnp.int32).reshape((8, 128))
     with self.assertRaisesRegex(
-        Exception, "core_map .* captures non-scalar constants"
+        Exception, "captures non-Ref constants"
     ):
       f(x)
 

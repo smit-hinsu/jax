@@ -207,8 +207,18 @@ class Buffered:
   revisit: RevisitMode | None = None
 
 
+@runtime_checkable
+class MemoryRefBase(Protocol):
+
+  def get_array_aval(self) -> jax_core.ShapedArray:
+    ...
+
+  def get_ref_aval(self) -> TransformedRef | state.AbstractRef:
+    ...
+
+
 @dataclasses.dataclass(frozen=True)
-class MemoryRef:
+class MemoryRef(MemoryRefBase):
   """Like jax.ShapeDtypeStruct but with memory spaces."""
   inner_aval: jax_core.AbstractValue
   # TODO(b/368122763): Unify memory space types across backends
@@ -1539,6 +1549,8 @@ effects.remat_allowed_effects.add_type(CommsEffect)
 effects.custom_derivatives_allowed_effects.add_type(CommsEffect)
 
 kernel_local_effects: effects.EffectTypeSet = effects.EffectTypeSet()
+kernel_local_effects.add_type(jax_core.InternalMutableArrayEffect)
+kernel_local_effects.add_type(CommsEffect)
 
 
 def get_interpret_effects(interpret: Any) -> Set[effects.Effect]:
