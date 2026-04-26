@@ -478,6 +478,39 @@ class PallasCallPipelineTest(jtu.JaxTestCase):
 
     np.testing.assert_allclose(out, expected_out, atol=5e-5)
 
+  def test_emit_pipeline_last_block_not_aligned(self):
+    M, N = 2048, 128
+    BLOCK = 32
+
+    def outer_kernel(x_hbm, out_hbm):
+      def body(x_vmem, out_vmem):
+        out_vmem[...] = x_vmem[...] + 1.0
+
+      pltpu.emit_pipeline(
+          body,
+          grid=(M // BLOCK,),
+          in_specs=[
+              pl.BlockSpec(
+                  (BLOCK, N),
+                  lambda i: (i, 0),
+              ),
+          ],
+          out_specs=[
+              pl.BlockSpec(
+                  (BLOCK, N),
+                  lambda i: (i, 0),
+              ),
+          ],
+      )(x_hbm, out_hbm)
+
+    x = jnp.arange(M * N, dtype=jnp.float32).reshape(M, N)
+
+    out = pl.pallas_call(
+        outer_kernel,
+        out_shape=jax.ShapeDtypeStruct((M, N), jnp.float32),
+    )(x)
+    np.testing.assert_allclose(out, x + 1.0)
+
 
 class PallasCallMultipleBufferedPipelineTest(jtu.JaxTestCase):
 
